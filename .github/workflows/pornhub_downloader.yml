@@ -18,7 +18,7 @@ on:
         type: string
         default: 'bestvideo[height<=720]+bestaudio/best[ext=mp4]/best'
       archive_name:
-        description: 'Base name for the RAR archive (if file is split)'
+        description: 'Base name for the 7z archive (if file is split)'
         required: false
         type: string
         default: 'video'
@@ -32,110 +32,114 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        env:
+          URL: ${{ inputs.url }}
+          FOLDER: ${{ inputs.output_folder }}
+        run: |
+          python3 scripts/validate_workflow.py --url "$URL" --folder "$FOLDER"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.10'
 
-      - name: Install yt-dlp and bc
+      - name: Install yt-dlp and 7-Zip
         run: |
           pip install yt-dlp
-          sudo apt-get update && sudo apt-get install -y bc
+          sudo apt-get update && sudo apt-get install -y p7zip-full ffmpeg
 
       - name: Download video (retry up to 5 times)
         id: download
+        env:
+          WF_GITHUB_EVENT_INPUTS_OUTPUT_FOLDER: ${{ github.event.inputs.output_folder }}
+          WF_GITHUB_EVENT_INPUTS_QUALITY: ${{ github.event.inputs.quality }}
+          WF_GITHUB_EVENT_INPUTS_URL: ${{ github.event.inputs.url }}
         run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
+          FOLDER="$RUNNER_TEMP/meli-video"
           mkdir -p "$FOLDER"
-          touch marker
-
-          MAX_RETRIES=5
-          RETRY_COUNT=0
+          LIST="$RUNNER_TEMP/meli-video-output.txt"
           SUCCESS=false
-
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            echo "Download attempt $((RETRY_COUNT+1))/$MAX_RETRIES"
-            yt-dlp \
-              --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
-              --format "${{ github.event.inputs.quality }}" \
-              --merge-output-format mp4 \
-              --retries 3 \
-              --fragment-retries 10 \
-              --no-check-certificate \
-              --geo-bypass \
-              --no-color \
-              --ignore-errors \
-              --newline \
-              "${{ github.event.inputs.url }}" && {
-                # Verify that a new file was actually created
-                NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit)
-                if [ -n "$NEW_FILE" ]; then
-                  echo "Download succeeded: $NEW_FILE"
+          for attempt in 1 2 3 4 5; do
+            echo "Download attempt $attempt/5"
+            rm -f -- "$LIST"
+            if yt-dlp \
+              --output "$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+              --format "$WF_GITHUB_EVENT_INPUTS_QUALITY" \
+              --merge-output-format mp4 --no-playlist --restrict-filenames \
+              --retries 3 --fragment-retries 10 --no-color --newline \
+              --print-to-file 'after_move:filepath' "$LIST" \
+              -- "$WF_GITHUB_EVENT_INPUTS_URL"; then
+              if [ -f "$LIST" ]; then
+                mapfile -t completed < "$LIST"
+                if [ "${#completed[@]}" -eq 1 ] && [ -f "${completed[0]}" ]; then
+                  NEW_FILE="${completed[0]}"
                   SUCCESS=true
                   break
-                else
-                  echo "The download command exited with code 0, but no new file was found. Retrying..."
                 fi
-              } || {
-                echo "Download attempt failed with exit code $?"
-              }
-            RETRY_COUNT=$((RETRY_COUNT+1))
-            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-              echo "Waiting 5 seconds before next attempt..."
-              sleep 5
+              fi
+              echo "No single completed file was returned by yt-dlp"
             fi
+            if [ "$attempt" -lt 5 ]; then sleep 5; fi
           done
-
-          if [ "$SUCCESS" = false ]; then
-            echo "Error: All $MAX_RETRIES download attempts failed."
-            exit 1
+          if [ "$SUCCESS" != true ]; then
+            echo "::error::All download attempts failed"; exit 1
           fi
-
-          FILENAME=$(basename "$NEW_FILE")
-          SIZE_BYTES=$(stat -c %s "$NEW_FILE")
-          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
-          echo "size_bytes=$SIZE_BYTES" >> $GITHUB_OUTPUT
-          echo "Downloaded: $NEW_FILE (${SIZE_BYTES} bytes)"
+          FILENAME=$(basename -- "$NEW_FILE")
+          if [ "$NEW_FILE" != "$FOLDER/$FILENAME" ]; then
+            echo "::error::Unexpected output path from yt-dlp"; exit 1
+          fi
+          # A previous failed attempt may have left a .part file. Publish only
+          # the completed file reported by yt-dlp, not stale intermediates.
+          find "$FOLDER" -maxdepth 1 -type f ! -name "$FILENAME" -delete
+          SIZE_BYTES=$(stat -c %s -- "$NEW_FILE")
+          printf 'filename=%s\nsize_bytes=%s\n' "$FILENAME" "$SIZE_BYTES" >> "$GITHUB_OUTPUT"
         shell: bash
-
-      - name: Install RAR
-        run: sudo apt-get install -y rar
 
       - name: Conditional split (if file > 99 MB)
         id: split
+        env:
+          WF_GITHUB_EVENT_INPUTS_OUTPUT_FOLDER: ${{ github.event.inputs.output_folder }}
+          WF_STEPS_DOWNLOAD_OUTPUTS_FILENAME: ${{ steps.download.outputs.filename }}
+          WF_STEPS_DOWNLOAD_OUTPUTS_SIZE_BYTES: ${{ steps.download.outputs.size_bytes }}
+          WF_GITHUB_EVENT_INPUTS_ARCHIVE_NAME: ${{ github.event.inputs.archive_name }}
         run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          FILENAME="${{ steps.download.outputs.filename }}"
-          SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
-          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
-          THRESHOLD_MB=99
-
+          FOLDER="$RUNNER_TEMP/meli-video"
+          FILENAME="${WF_STEPS_DOWNLOAD_OUTPUTS_FILENAME}"
+          SIZE_BYTES="${WF_STEPS_DOWNLOAD_OUTPUTS_SIZE_BYTES}"
           cd "$FOLDER"
 
-          if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
-            echo "File size ${SIZE_MB} MB exceeds ${THRESHOLD_MB} MB – splitting into 95 MB RAR parts."
+          if [ "$SIZE_BYTES" -gt $((99 * 1024 * 1024)) ]; then
+            echo "File exceeds 99 MiB – splitting into 95 MiB 7z parts."
             # Append a random 6‑character hex suffix to avoid name collisions
             RANDOM_HEX=$(openssl rand -hex 3)
-            ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
+            [[ "$WF_GITHUB_EVENT_INPUTS_ARCHIVE_NAME" =~ ^[a-zA-Z0-9_-]{1,100}$ ]] || { echo "::error::Invalid archive name"; exit 1; }
+            ARCHIVE_NAME="${WF_GITHUB_EVENT_INPUTS_ARCHIVE_NAME}_${RANDOM_HEX}"
             echo "Archive base name: ${ARCHIVE_NAME}"
-            rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
+            7z a -v95m -mx=3 "${ARCHIVE_NAME}.7z" -- "$FILENAME"
             rm "$FILENAME"   # Remove original file after successful split
             echo "split_done=true" >> $GITHUB_OUTPUT
             echo "Split completed. Parts created:"
-            ls -lh "${ARCHIVE_NAME}.part"*.rar
+            ls -lh "${ARCHIVE_NAME}.7z"*
           else
-            echo "File size ${SIZE_MB} MB is ≤${THRESHOLD_MB} MB – keeping original file (no RAR)."
+            echo "File is at most 99 MiB – keeping original file (no archive)."
             echo "split_done=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Commit and push to repository
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          WF_GITHUB_EVENT_INPUTS_OUTPUT_FOLDER: ${{ github.event.inputs.output_folder }}
         run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
+          FOLDER="${WF_GITHUB_EVENT_INPUTS_OUTPUT_FOLDER}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$FOLDER/"
-          git commit -m "Add downloaded video(s)"
-          git push
-          
+          python3 scripts/move_outputs.py "$RUNNER_TEMP/meli-video" "$FOLDER"
+          git add -- "$FOLDER/"
+          python3 scripts/check_staged_sizes.py
+          git diff --cached --quiet || git commit -m "Add downloaded video(s) [skip ci]"
+          bash scripts/push_current_branch.sh

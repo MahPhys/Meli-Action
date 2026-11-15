@@ -132,8 +132,8 @@ on:
       max_part_mb:
         description: 'Maximum part size in MB for splitting (0 = no split)'
         required: false
-        type: number
-        default: 90
+        type: string
+        default: '90'
 
       output_folder:
         description: 'Folder to store downloads (relative to repo root)'
@@ -157,15 +157,34 @@ jobs:
 
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Validate inputs
+        env:
+          URL: ${{ inputs.video_url }}
+          FOLDER: ${{ inputs.output_folder }}
+          SIZE: ${{ inputs.max_part_mb }}
+        run: |
+          python3 scripts/validate_workflow.py --url "$URL" --folder "$FOLDER" --size "$SIZE" --allow-zero
 
       - name: Install tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg zip
-          pip install -q -U "yt-dlp[default]" bgutil-ytdlp-pot-provider
+          pip install -q -U "yt-dlp[default]" "bgutil-ytdlp-pot-provider==1.3.1"
           git clone --depth 1 --branch 1.3.1 \
             https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
             /tmp/bgutil
@@ -173,43 +192,52 @@ jobs:
 
       - name: Start PO Token provider server
         run: |
-          node /tmp/bgutil/server/build/main.js &
-          sleep 5
+          node /tmp/bgutil/server/build/main.js > "$RUNNER_TEMP/bgutil.log" 2>&1 &
+          curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 \
+            http://127.0.0.1:4416/ping || { cat "$RUNNER_TEMP/bgutil.log"; exit 1; }
 
       - name: Download media
         run: |
-          URL="${{ github.event.inputs.video_url }}"
-          FORMAT_INPUT="${{ github.event.inputs.output_format }}"
-          VIDEO_QUALITY="${{ github.event.inputs.video_quality }}"
-          AUDIO_Q="${{ github.event.inputs.audio_quality }}"
-          CODEC="${{ github.event.inputs.video_codec }}"
-          FRAGMENTS="${{ github.event.inputs.concurrent_fragments }}"
-          OUTPUT_FOLDER="${{ github.event.inputs.output_folder }}"
-          TRIM_START="${{ github.event.inputs.trim_start }}"
-          TRIM_END="${{ github.event.inputs.trim_end }}"
-          PLAYLIST_ITEMS="${{ github.event.inputs.playlist_items }}"
-          SUBTITLES="${{ github.event.inputs.download_subtitles }}"
-          SUB_LANGS="${{ github.event.inputs.subtitle_langs }}"
-          EMBED_META="${{ github.event.inputs.embed_metadata }}"
-          EMBED_CHAPTERS="${{ github.event.inputs.embed_chapters }}"
-          SPONSORBLOCK="${{ github.event.inputs.sponsorblock }}"
-          WRITE_DESC="${{ github.event.inputs.write_description }}"
-          EXTRA_ARGS="${{ github.event.inputs.extra_args }}"
+          URL="${WF_GITHUB_EVENT_INPUTS_VIDEO_URL}"
+          FORMAT_INPUT="${WF_GITHUB_EVENT_INPUTS_OUTPUT_FORMAT}"
+          VIDEO_QUALITY="${WF_GITHUB_EVENT_INPUTS_VIDEO_QUALITY}"
+          AUDIO_Q="${WF_GITHUB_EVENT_INPUTS_AUDIO_QUALITY}"
+          CODEC="${WF_GITHUB_EVENT_INPUTS_VIDEO_CODEC}"
+          FRAGMENTS="${WF_GITHUB_EVENT_INPUTS_CONCURRENT_FRAGMENTS}"
+          OUTPUT_FOLDER="$RUNNER_TEMP/meli-media"
+          TRIM_START="${WF_GITHUB_EVENT_INPUTS_TRIM_START}"
+          TRIM_END="${WF_GITHUB_EVENT_INPUTS_TRIM_END}"
+          PLAYLIST_ITEMS="${WF_GITHUB_EVENT_INPUTS_PLAYLIST_ITEMS}"
+          SUBTITLES="${WF_GITHUB_EVENT_INPUTS_DOWNLOAD_SUBTITLES}"
+          SUB_LANGS="${WF_GITHUB_EVENT_INPUTS_SUBTITLE_LANGS}"
+          EMBED_META="${WF_GITHUB_EVENT_INPUTS_EMBED_METADATA}"
+          EMBED_CHAPTERS="${WF_GITHUB_EVENT_INPUTS_EMBED_CHAPTERS}"
+          SPONSORBLOCK="${WF_GITHUB_EVENT_INPUTS_SPONSORBLOCK}"
+          WRITE_DESC="${WF_GITHUB_EVENT_INPUTS_WRITE_DESCRIPTION}"
+          EXTRA_ARGS="${WF_GITHUB_EVENT_INPUTS_EXTRA_ARGS}"
 
           mkdir -p "$OUTPUT_FOLDER"
 
-          # Cookie handling: prefer inline input, fallback to YT_COOKIES secret
-          COOKIE_ARGS=""
-          if [ -n "$INPUT_COOKIES" ]; then
-            printf '%s' "$INPUT_COOKIES" > /tmp/cookies.txt
-            COOKIE_ARGS="--cookies /tmp/cookies.txt"
-          elif [ -n "$SECRET_YT_COOKIES" ]; then
-            printf '%s' "$SECRET_YT_COOKIES" > /tmp/cookies.txt
-            COOKIE_ARGS="--cookies /tmp/cookies.txt"
+          # Keep cookies private and delete the file when this step exits.
+          COOKIE_ARGS=()
+          COOKIE_FILE=""
+          trap 'if [ -n "$COOKIE_FILE" ]; then rm -f -- "$COOKIE_FILE"; fi' EXIT
+          if [ -n "$INPUT_COOKIES" ] || [ -n "$SECRET_YT_COOKIES" ]; then
+            umask 077
+            COOKIE_FILE=$(mktemp "$RUNNER_TEMP/meli-cookies.XXXXXX")
+            if [ -n "$INPUT_COOKIES" ]; then
+              printf '%s' "$INPUT_COOKIES" > "$COOKIE_FILE"
+            else
+              printf '%s' "$SECRET_YT_COOKIES" > "$COOKIE_FILE"
+            fi
+            COOKIE_ARGS=(--cookies "$COOKIE_FILE")
           fi
 
           # Extract numeric height from quality string (e.g. "2160 (4K)" -> "2160")
-          QUALITY_NUM=$(echo "$VIDEO_QUALITY" | grep -o '[0-9]*' | head -1)
+          QUALITY_NUM="${VIDEO_QUALITY%% *}"
+          if [[ "$QUALITY_NUM" != best && ! "$QUALITY_NUM" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid video quality"; exit 1
+          fi
 
           # Codec filter
           case "$CODEC" in
@@ -219,94 +247,119 @@ jobs:
             *)                       CODEC_FILTER=""               ; MERGE_FMT="mp4" ;;
           esac
 
-          # Format / quality selection
+          # Format selection: keep the preferred codec even at "best" quality.
           if [ "$FORMAT_INPUT" = "mp3 (audio only)" ]; then
-            FORMAT_ARGS="-x --audio-format mp3 --audio-quality ${AUDIO_Q}K"
-          elif [ "$FORMAT_INPUT" = "best (auto)" ] || [ "$VIDEO_QUALITY" = "best" ]; then
-            FORMAT_ARGS="-f bestvideo+bestaudio --merge-output-format mp4"
+            FORMAT_ARGS=(-x --audio-format mp3 --audio-quality "${AUDIO_Q}K")
           else
-            if [ -n "$CODEC_FILTER" ]; then
-              FORMAT_ARGS="-f bestvideo[height<=${QUALITY_NUM}]${CODEC_FILTER}+bestaudio/bestvideo[height<=${QUALITY_NUM}]+bestaudio/best[height<=${QUALITY_NUM}] --merge-output-format ${MERGE_FMT}"
-            else
-              FORMAT_ARGS="-f bestvideo[height<=${QUALITY_NUM}]+bestaudio/best[height<=${QUALITY_NUM}] --merge-output-format mp4"
+            HEIGHT_FILTER=""
+            if [ "$FORMAT_INPUT" != "best (auto)" ] && [ "$VIDEO_QUALITY" != "best" ]; then
+              HEIGHT_FILTER="[height<=${QUALITY_NUM}]"
             fi
+            if [ -n "$CODEC_FILTER" ]; then
+              SELECTOR="bestvideo${HEIGHT_FILTER}${CODEC_FILTER}+bestaudio/best${HEIGHT_FILTER}${CODEC_FILTER}/bestvideo${HEIGHT_FILTER}+bestaudio/best${HEIGHT_FILTER}"
+            else
+              SELECTOR="bestvideo${HEIGHT_FILTER}+bestaudio/best${HEIGHT_FILTER}"
+            fi
+            FORMAT_ARGS=(-f "$SELECTOR" --merge-output-format "$MERGE_FMT")
           fi
 
           # Trim / section
-          SECTION_ARGS=""
+          SECTION_ARGS=()
           if [ -n "$TRIM_START" ] && [ -n "$TRIM_END" ]; then
-            SECTION_ARGS="--download-sections *${TRIM_START}-${TRIM_END} --force-keyframes-at-cuts"
+            SECTION_ARGS=(--download-sections "*${TRIM_START}-${TRIM_END}" --force-keyframes-at-cuts)
           elif [ -n "$TRIM_START" ]; then
-            SECTION_ARGS="--download-sections *${TRIM_START}-inf --force-keyframes-at-cuts"
+            SECTION_ARGS=(--download-sections "*${TRIM_START}-inf" --force-keyframes-at-cuts)
           elif [ -n "$TRIM_END" ]; then
-            SECTION_ARGS="--download-sections *0-${TRIM_END} --force-keyframes-at-cuts"
+            SECTION_ARGS=(--download-sections "*0-${TRIM_END}" --force-keyframes-at-cuts)
           fi
 
           # Playlist range
-          PLAYLIST_ARGS="--no-playlist"
+          PLAYLIST_ARGS=(--no-playlist)
           if [ -n "$PLAYLIST_ITEMS" ]; then
             if [ "$PLAYLIST_ITEMS" = "all" ]; then
-              PLAYLIST_ARGS=""
+              PLAYLIST_ARGS=()
             else
-              PLAYLIST_ARGS="--playlist-items $PLAYLIST_ITEMS"
+              PLAYLIST_ARGS=(--playlist-items "$PLAYLIST_ITEMS")
             fi
           fi
 
           # Subtitles
-          SUBTITLE_ARGS=""
+          SUBTITLE_ARGS=()
           if [ "$SUBTITLES" = "true" ]; then
-            SUBTITLE_ARGS="--write-subs --write-auto-subs --sub-langs ${SUB_LANGS}"
+            SUBTITLE_ARGS=(--write-subs --write-auto-subs --sub-langs "$SUB_LANGS")
           fi
 
           # Metadata / thumbnail embedding
-          META_ARGS=""
+          META_ARGS=()
           if [ "$EMBED_META" = "true" ]; then
-            META_ARGS="--embed-thumbnail --embed-metadata --add-metadata"
+            META_ARGS=(--embed-thumbnail --embed-metadata --add-metadata)
           fi
 
           # Chapter markers
-          CHAPTER_ARGS=""
+          CHAPTER_ARGS=()
           if [ "$EMBED_CHAPTERS" = "true" ]; then
-            CHAPTER_ARGS="--embed-chapters"
+            CHAPTER_ARGS=(--embed-chapters)
           fi
 
           # SponsorBlock
-          SPONSOR_ARGS=""
+          SPONSOR_ARGS=()
           if [ "$SPONSORBLOCK" = "true" ]; then
-            SPONSOR_ARGS="--sponsorblock-remove sponsor,intro,outro,selfpromo,interaction"
+            SPONSOR_ARGS=(--sponsorblock-remove sponsor,intro,outro,selfpromo,interaction)
           fi
 
           # Description file
-          DESC_ARGS=""
+          DESC_ARGS=()
           if [ "$WRITE_DESC" = "true" ]; then
-            DESC_ARGS="--write-description"
+            DESC_ARGS=(--write-description)
           fi
 
+          # Parse shell-style quoting as data, without evaluating shell code.
+          python3 -c 'import shlex,sys; [sys.stdout.buffer.write(x.encode()+b"\0") for x in shlex.split(sys.argv[1])]' "$EXTRA_ARGS" > "$RUNNER_TEMP/meli-args"
+          mapfile -d '' -t EXTRA_ARGV < "$RUNNER_TEMP/meli-args"
           yt-dlp \
             --js-runtimes node \
             --newline \
-            --extractor-args "youtube:player_client=web_music,web,tv" \
             --concurrent-fragments "${FRAGMENTS}" \
-            $FORMAT_ARGS \
-            $SECTION_ARGS \
-            $SUBTITLE_ARGS \
-            $META_ARGS \
-            $CHAPTER_ARGS \
-            $SPONSOR_ARGS \
-            $DESC_ARGS \
-            $PLAYLIST_ARGS \
-            $COOKIE_ARGS \
+            "${FORMAT_ARGS[@]}" \
+            "${SECTION_ARGS[@]}" \
+            "${SUBTITLE_ARGS[@]}" \
+            "${META_ARGS[@]}" \
+            "${CHAPTER_ARGS[@]}" \
+            "${SPONSOR_ARGS[@]}" \
+            "${DESC_ARGS[@]}" \
+            "${PLAYLIST_ARGS[@]}" \
+            "${COOKIE_ARGS[@]}" \
             -o "$OUTPUT_FOLDER/%(title)s [%(id)s].%(ext)s" \
-            $EXTRA_ARGS \
-            "$URL"
+            "${EXTRA_ARGV[@]}" \
+            -- "$URL"
         env:
+          WF_GITHUB_EVENT_INPUTS_VIDEO_URL: ${{ github.event.inputs.video_url }}
+          WF_GITHUB_EVENT_INPUTS_OUTPUT_FORMAT: ${{ github.event.inputs.output_format }}
+          WF_GITHUB_EVENT_INPUTS_VIDEO_QUALITY: ${{ github.event.inputs.video_quality }}
+          WF_GITHUB_EVENT_INPUTS_AUDIO_QUALITY: ${{ github.event.inputs.audio_quality }}
+          WF_GITHUB_EVENT_INPUTS_VIDEO_CODEC: ${{ github.event.inputs.video_codec }}
+          WF_GITHUB_EVENT_INPUTS_CONCURRENT_FRAGMENTS: ${{ github.event.inputs.concurrent_fragments }}
+          WF_GITHUB_EVENT_INPUTS_OUTPUT_FOLDER: ${{ github.event.inputs.output_folder }}
+          WF_GITHUB_EVENT_INPUTS_TRIM_START: ${{ github.event.inputs.trim_start }}
+          WF_GITHUB_EVENT_INPUTS_TRIM_END: ${{ github.event.inputs.trim_end }}
+          WF_GITHUB_EVENT_INPUTS_PLAYLIST_ITEMS: ${{ github.event.inputs.playlist_items }}
+          WF_GITHUB_EVENT_INPUTS_DOWNLOAD_SUBTITLES: ${{ github.event.inputs.download_subtitles }}
+          WF_GITHUB_EVENT_INPUTS_SUBTITLE_LANGS: ${{ github.event.inputs.subtitle_langs }}
+          WF_GITHUB_EVENT_INPUTS_EMBED_METADATA: ${{ github.event.inputs.embed_metadata }}
+          WF_GITHUB_EVENT_INPUTS_EMBED_CHAPTERS: ${{ github.event.inputs.embed_chapters }}
+          WF_GITHUB_EVENT_INPUTS_SPONSORBLOCK: ${{ github.event.inputs.sponsorblock }}
+          WF_GITHUB_EVENT_INPUTS_WRITE_DESCRIPTION: ${{ github.event.inputs.write_description }}
+          WF_GITHUB_EVENT_INPUTS_EXTRA_ARGS: ${{ github.event.inputs.extra_args }}
           INPUT_COOKIES: ${{ github.event.inputs.cookies }}
           SECRET_YT_COOKIES: ${{ secrets.YT_COOKIES }}
 
       - name: Split oversized files (optional)
+        env:
+          WF_GITHUB_EVENT_INPUTS_OUTPUT_FOLDER: ${{ github.event.inputs.output_folder }}
+          WF_GITHUB_EVENT_INPUTS_MAX_PART_MB: ${{ github.event.inputs.max_part_mb }}
         run: |
-          OUTPUT_FOLDER="${{ github.event.inputs.output_folder }}"
-          THRESH_MB=${{ github.event.inputs.max_part_mb }}
+          OUTPUT_FOLDER="$RUNNER_TEMP/meli-media"
+          THRESH_MB=${WF_GITHUB_EVENT_INPUTS_MAX_PART_MB}
           THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
 
           for f in "$OUTPUT_FOLDER"/*; do
@@ -314,15 +367,26 @@ jobs:
             fs=$(stat -c%s "$f")
             fname=$(basename "$f")
             if [ "$THRESH_BYTES" -gt 0 ] && [ "$fs" -gt "$THRESH_BYTES" ]; then
-              zip -j -s "${THRESH_MB}m" "$OUTPUT_FOLDER/${fname}.zip" "$f"
-              rm "$f"
+              shopt -s nullglob
+              parts=("$OUTPUT_FOLDER/${fname}".z[0-9]*)
+              if [ -e "$OUTPUT_FOLDER/${fname}.zip" ] || [ "${#parts[@]}" -gt 0 ]; then
+                echo "::error::Archive or split parts already exist for $fname"; exit 1
+              fi
+              zip -j -s "${THRESH_MB}m" "$OUTPUT_FOLDER/${fname}.zip" -- "$f"
+              rm -- "$f"
             fi
           done
 
       - name: Push changes to repository
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          WF_GITHUB_EVENT_INPUTS_OUTPUT_FOLDER: ${{ github.event.inputs.output_folder }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ github.event.inputs.output_folder }}/"
-          git commit -m "Download media [skip ci]" || echo "Nothing to commit"
-          git push
+          mkdir -p -- "$WF_GITHUB_EVENT_INPUTS_OUTPUT_FOLDER"
+          python3 scripts/move_outputs.py "$RUNNER_TEMP/meli-media" "$WF_GITHUB_EVENT_INPUTS_OUTPUT_FOLDER"
+          git add -- "${WF_GITHUB_EVENT_INPUTS_OUTPUT_FOLDER}/"
+          python3 scripts/check_staged_sizes.py
+          git diff --cached --quiet || git commit -m "Download media [skip ci]"
+          bash scripts/push_current_branch.sh

@@ -35,111 +35,133 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
           fetch-depth: 1
 
+      - name: Validate inputs
+        env:
+          FOLDER: ${{ inputs.output_folder }}
+        run: |
+          python3 scripts/validate_workflow.py --folder "$FOLDER"
+
       - name: Create output folder
-        run: mkdir -p "${{ inputs.output_folder }}"
+        env:
+          WF_INPUTS_OUTPUT_FOLDER: ${{ inputs.output_folder }}
+        run: mkdir -p "${WF_INPUTS_OUTPUT_FOLDER}"
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y openjdk-17-jre-headless apksigner python3 python3-venv python3-pip curl git
+          sudo apt-get install -y openjdk-17-jre-headless apksigner p7zip-full python3 python3-venv python3-pip curl git
 
       - name: Clone gplay-apk-downloader
         run: |
-          git clone https://github.com/alltechdev/gplay-apk-downloader.git
+          git clone --depth 1 https://github.com/alltechdev/gplay-apk-downloader.git
           cd gplay-apk-downloader
           ./setup.sh
 
       - name: Authenticate with Google Play
+        env:
+          DISPENSER_URL: ${{ secrets.GPLAY_DISPENSER_URL }}
         run: |
+          if [ -z "$DISPENSER_URL" ]; then
+            echo "::error::Set the GPLAY_DISPENSER_URL repository secret to a token dispenser you control."
+            exit 1
+          fi
           cd gplay-apk-downloader
-          echo "y" | ./gplay auth
+          ./gplay auth
           echo "Authentication completed."
 
       - name: Download APK
         id: download
+        env:
+          WF_INPUTS_ARCHITECTURE: ${{ inputs.architecture }}
+          WF_INPUTS_MERGE_SPLITS: ${{ inputs.merge_splits }}
+          WF_INPUTS_OUTPUT_FOLDER: ${{ inputs.output_folder }}
+          WF_INPUTS_PACKAGE_NAME: ${{ inputs.package_name }}
         run: |
           cd gplay-apk-downloader
-          ARCH="${{ inputs.architecture }}"
-          MERGE="${{ inputs.merge_splits }}"
-          OUTPUT_DIR="../${{ inputs.output_folder }}"
+          ARCH="${WF_INPUTS_ARCHITECTURE}"
+          MERGE="${WF_INPUTS_MERGE_SPLITS}"
+          OUTPUT_DIR="$RUNNER_TEMP/gplay-output"
+          mkdir -p "$OUTPUT_DIR"
           
-          CMD="./gplay download ${{ inputs.package_name }} -a $ARCH -o $OUTPUT_DIR"
-          if [ "$MERGE" = "true" ]; then
-            CMD="$CMD -m"
+          [[ "$WF_INPUTS_PACKAGE_NAME" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]] || { echo "::error::Invalid package name"; exit 1; }
+          CMD=(./gplay download "$WF_INPUTS_PACKAGE_NAME" -a "$ARCH" -o "$OUTPUT_DIR")
+          if [ "$MERGE" = "true" ]; then CMD+=(-m); fi
+          "${CMD[@]}"
+          
+          # The upstream CLI leaves one APK when merging succeeds (or no splits
+          # exist); on merge failure it can return success and leave several.
+          shopt -s nullglob
+          apks=("$OUTPUT_DIR"/*.apk)
+          bundles=("$OUTPUT_DIR"/*.zip)
+          if [ "${#apks[@]}" -eq 0 ] && [ "${#bundles[@]}" -eq 0 ]; then
+            echo "::error::No APK or split bundle was downloaded"; exit 1
           fi
-          
-          echo "Running: $CMD"
-          $CMD
-          
-          # Find downloaded file(s)
-          cd "$OUTPUT_DIR"
-          if [ "$MERGE" = "true" ]; then
-            DOWNLOADED_FILE=$(ls -1 *.apk 2>/dev/null | head -n1)
-          else
-            DOWNLOADED_FILE=$(ls -1 *.apk *.zip 2>/dev/null | head -n1)
+          if [ "$MERGE" = "true" ] && { [ "${#apks[@]}" -ne 1 ] || [ "${#bundles[@]}" -ne 0 ]; }; then
+            echo "::error::Merge did not produce exactly one APK; refusing to publish incomplete output"; exit 1
           fi
-          
-          if [ -z "$DOWNLOADED_FILE" ]; then
-            echo "Error: No file downloaded"
-            exit 1
-          fi
-          
-          echo "downloaded_file_path=$OUTPUT_DIR/$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
-          echo "downloaded_file_name=$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
+          # Upstream may report success after a failed signing operation or a
+          # failed split download. Refuse to publish invalid or unsigned APKs.
+          for apk in "${apks[@]}"; do
+            if ! apksigner verify "$apk"; then
+              echo "::error::APK signature verification failed"; exit 1
+            fi
+          done
 
       - name: Generate timestamp for unique archive
         id: timestamp
         run: echo "value=$(date +%Y%m%d_%H%M%S)" >> $GITHUB_OUTPUT
 
       - name: Create split archive (85MB chunks)
+        env:
+          WF_STEPS_TIMESTAMP_OUTPUTS_VALUE: ${{ steps.timestamp.outputs.value }}
+          WF_INPUTS_PACKAGE_NAME: ${{ inputs.package_name }}
+          WF_INPUTS_ARCHITECTURE: ${{ inputs.architecture }}
+          WF_INPUTS_MERGE_SPLITS: ${{ inputs.merge_splits }}
+          WF_INPUTS_OUTPUT_FOLDER: ${{ inputs.output_folder }}
         run: |
-          DOWNLOADED_FILE="${{ steps.download.outputs.downloaded_file_path }}"
-          TIMESTAMP="${{ steps.timestamp.outputs.value }}"
-          PACKAGE_NAME="${{ inputs.package_name }}"
-          ARCH="${{ inputs.architecture }}"
+          TIMESTAMP="${WF_STEPS_TIMESTAMP_OUTPUTS_VALUE}"
+          PACKAGE_NAME="${WF_INPUTS_PACKAGE_NAME}"
+          ARCH="${WF_INPUTS_ARCHITECTURE}"
           
           # Create archive name
-          if [ "${{ inputs.merge_splits }}" = "true" ]; then
+          if [ "${WF_INPUTS_MERGE_SPLITS}" = "true" ]; then
             ARCHIVE_NAME="${PACKAGE_NAME}_${ARCH}_merged_${TIMESTAMP}"
           else
             ARCHIVE_NAME="${PACKAGE_NAME}_${ARCH}_splits_${TIMESTAMP}"
           fi
           
-          cd "${{ inputs.output_folder }}"
-          
-          # Compress and split the downloaded file(s)
-          if [ "${{ inputs.merge_splits }}" = "true" ]; then
-            # Single APK file - split into chunks
-            7z a -mx=3 -v85m "${ARCHIVE_NAME}.7z" "$(basename "$DOWNLOADED_FILE")"
-          else
-            # Multiple split files - use separate archive for each
-            mkdir -p "${ARCHIVE_NAME}_contents"
-            cp "$(basename "$DOWNLOADED_FILE")" "${ARCHIVE_NAME}_contents/"
-            7z a -mx=3 -v85m "${ARCHIVE_NAME}.7z" "${ARCHIVE_NAME}_contents/"
-          fi
-          
-          # Rename single-chunk archive to .7z
-          if [ -f "${ARCHIVE_NAME}.7z.001" ] && [ ! -f "${ARCHIVE_NAME}.7z.002" ]; then
-            mv "${ARCHIVE_NAME}.7z.001" "${ARCHIVE_NAME}.7z"
-          fi
+          # Include every split APK/bundle, with no runner-specific path inside the archive.
+          OUTPUT_DIR="$RUNNER_TEMP/gplay-output"
+          ARCHIVE_DIR="$RUNNER_TEMP/gplay-archive"
+          mkdir -p "$ARCHIVE_DIR"
+          ARCHIVE_PATH="$ARCHIVE_DIR/${ARCHIVE_NAME}.7z"
+          cd "$OUTPUT_DIR"
+          shopt -s nullglob
+          files=(*.apk *.zip)
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::No downloaded files to archive"; exit 1; }
+          7z a -mx=3 -v85m "$ARCHIVE_PATH" -- "${files[@]}"
 
-      - name: Remove original downloaded file(s)
-        run: |
-          DOWNLOADED_FILE="${{ steps.download.outputs.downloaded_file_path }}"
-          if [[ -n "$DOWNLOADED_FILE" && -f "$DOWNLOADED_FILE" ]]; then
-            rm "$DOWNLOADED_FILE"
+          # Rename single-chunk archive to .7z
+          if [ -f "${ARCHIVE_PATH}.001" ] && [ ! -f "${ARCHIVE_PATH}.002" ]; then
+            mv "${ARCHIVE_PATH}.001" "$ARCHIVE_PATH"
           fi
-          # Also remove any extracted directories
-          rm -rf "${{ inputs.output_folder }}"/*_contents/
+          python3 "$GITHUB_WORKSPACE/scripts/move_outputs.py" "$ARCHIVE_DIR" "$GITHUB_WORKSPACE/${WF_INPUTS_OUTPUT_FOLDER}"
 
       - name: Commit and push
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          WF_INPUTS_OUTPUT_FOLDER: ${{ inputs.output_folder }}
+          WF_INPUTS_PACKAGE_NAME: ${{ inputs.package_name }}
+          WF_INPUTS_ARCHITECTURE: ${{ inputs.architecture }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ inputs.output_folder }}/"
-          git commit -m "Download ${{ inputs.package_name }} (${{ inputs.architecture }}) from Google Play [skip ci]" || echo "No changes to commit"
-          git push
+          git add -- "${WF_INPUTS_OUTPUT_FOLDER}/"
+          python3 scripts/check_staged_sizes.py
+          git diff --cached --quiet || git commit -m "Download ${WF_INPUTS_PACKAGE_NAME} (${WF_INPUTS_ARCHITECTURE}) from Google Play [skip ci]"
+          bash scripts/push_current_branch.sh

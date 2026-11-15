@@ -10,8 +10,8 @@ on:
       split_threshold_mb:
         description: '📦 Maximum file size per part (MB) – set 0 to disable splitting'
         required: false
-        type: number
-        default: 90
+        type: string
+        default: '90'
 
 permissions:
   contents: write
@@ -24,9 +24,22 @@ jobs:
 
     steps:
       - name: 📂 Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate inputs
+        env:
+          URL: ${{ inputs.telegram_link }}
+          SIZE: ${{ inputs.split_threshold_mb }}
+        run: |
+          python3 scripts/validate_workflow.py --url "$URL" --size "$SIZE" --allow-zero
 
       - name: 🔧 Install system dependencies
         run: |
@@ -36,116 +49,20 @@ jobs:
       - name: 🐍 Install Python dependencies
         run: pip3 install requests
 
-      - name: 📝 Create downloader script (with resume support)
-        run: |
-          cat > telegram_downloader.py << 'EOF'
-          #!/usr/bin/env python3
-          import requests
-          import sys
-          import time
-          from pathlib import Path
-
-          def download_with_resume(url, output_path, headers, max_retries=10, chunk_size=64*1024):
-              output_path = Path(output_path)
-              output_path.parent.mkdir(parents=True, exist_ok=True)
-              temp_path = output_path.with_suffix(output_path.suffix + ".partial")
-              
-              downloaded = temp_path.stat().st_size if temp_path.exists() else 0
-              session = requests.Session()
-              session.headers.update(headers)
-              
-              for attempt in range(max_retries):
-                  try:
-                      range_header = {"Range": f"bytes={downloaded}-"} if downloaded > 0 else {}
-                      resp = session.get(url, stream=True, timeout=30, headers=range_header)
-                      resp.raise_for_status()
-                      
-                      total_size = int(resp.headers.get('content-length', 0))
-                      if downloaded > 0:
-                          total_size = total_size + downloaded
-                      
-                      mode = 'ab' if downloaded > 0 else 'wb'
-                      with open(temp_path, mode) as f:
-                          for chunk in resp.iter_content(chunk_size=chunk_size):
-                              if chunk:
-                                  f.write(chunk)
-                                  downloaded += len(chunk)
-                                  if total_size > 0:
-                                      percent = downloaded / total_size * 100
-                                      bar_len = 40
-                                      filled = int(bar_len * downloaded // total_size)
-                                      bar = '█' * filled + '░' * (bar_len - filled)
-                                      print(f"\rProgress: |{bar}| {percent:.1f}% ({downloaded}/{total_size} bytes)",
-                                            end='', flush=True)
-                      print()
-                      temp_path.rename(output_path)
-                      return True
-                  except (requests.exceptions.ChunkedEncodingError,
-                          requests.exceptions.ConnectionError,
-                          requests.exceptions.Timeout) as e:
-                      print(f"\n⚠️ Connection lost: {e}. Retry {attempt+1}/{max_retries}")
-                      time.sleep(2 ** attempt)
-                  except Exception as e:
-                      print(f"\n❌ Fatal error: {e}")
-                      return False
-              print("\n❌ Max retries reached.")
-              return False
-
-          def download_telegram_file(telegram_link, output_dir="."):
-              api_url = "https://telegramdownloader.net/proxy.php"
-              headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-              data = {"telegram_link": telegram_link}
-              
-              try:
-                  print(f"🔗 Fetching download info...")
-                  resp = requests.post(api_url, headers=headers, data=data, timeout=15)
-                  resp.raise_for_status()
-                  result = resp.json()
-                  raw_url = result.get('data', {}).get('data', {}).get('link')
-                  file_name = result.get('data', {}).get('data', {}).get('file_name')
-                  if not raw_url or not file_name:
-                      print("❌ Could not extract download link or filename")
-                      return False, "", 0
-                  
-                  out_path = Path(output_dir) / file_name
-                  print(f"📁 File: {file_name}")
-                  print(f"🚀 Starting download with resume support...")
-                  
-                  success = download_with_resume(raw_url, out_path, headers)
-                  if success:
-                      size = out_path.stat().st_size
-                      print(f"✅ Download complete: {file_name} ({size/1e6:.2f} MB)")
-                      return True, file_name, size
-                  return False, "", 0
-              except Exception as e:
-                  print(f"❌ Error: {e}")
-                  return False, "", 0
-
-          if __name__ == "__main__":
-              if len(sys.argv) < 2:
-                  print("Usage: python telegram_downloader.py <telegram_link> [output_dir]")
-                  sys.exit(1)
-              link = sys.argv[1]
-              out_dir = sys.argv[2] if len(sys.argv) > 2 else "."
-              success, fname, fsize = download_telegram_file(link, out_dir)
-              if success:
-                  with open(Path(out_dir) / ".download_info", "w") as info:
-                      info.write(f"{fname}\n{fsize}")
-              sys.exit(0 if success else 1)
-          EOF
-          chmod +x telegram_downloader.py
-
       - name: 📥 Download Telegram file
         id: download
+        env:
+          WF_GITHUB_EVENT_INPUTS_TELEGRAM_LINK: ${{ github.event.inputs.telegram_link }}
         run: |
-          mkdir -p downloads
-          python3 telegram_downloader.py "${{ github.event.inputs.telegram_link }}" downloads
-          if [ -f downloads/.download_info ]; then
-            FILENAME=$(head -n1 downloads/.download_info)
-            FILESIZE=$(tail -n1 downloads/.download_info)
+          OUTPUT_DIR="$RUNNER_TEMP/meli-telegram"
+          mkdir -p "$OUTPUT_DIR"
+          python3 telegram_downloader.py "${WF_GITHUB_EVENT_INPUTS_TELEGRAM_LINK}" "$OUTPUT_DIR"
+          if [ -f "$OUTPUT_DIR/.download_info" ]; then
+            FILENAME=$(head -n1 "$OUTPUT_DIR/.download_info")
+            FILESIZE=$(tail -n1 "$OUTPUT_DIR/.download_info")
             echo "downloaded_name=$FILENAME" >> $GITHUB_OUTPUT
             echo "file_size=$FILESIZE" >> $GITHUB_OUTPUT
-            rm downloads/.download_info
+            rm "$OUTPUT_DIR/.download_info"
           else
             echo "❌ Download failed"
             exit 1
@@ -153,15 +70,19 @@ jobs:
 
       - name: ✂️ Split large file (if needed)
         if: github.event.inputs.split_threshold_mb != '0'
+        env:
+          WF_GITHUB_EVENT_INPUTS_SPLIT_THRESHOLD_MB: ${{ github.event.inputs.split_threshold_mb }}
+          WF_STEPS_DOWNLOAD_OUTPUTS_DOWNLOADED_NAME: ${{ steps.download.outputs.downloaded_name }}
+          WF_STEPS_DOWNLOAD_OUTPUTS_FILE_SIZE: ${{ steps.download.outputs.file_size }}
         run: |
-          THRESHOLD="${{ github.event.inputs.split_threshold_mb }}"
-          FILENAME="${{ steps.download.outputs.downloaded_name }}"
-          FILE_SIZE="${{ steps.download.outputs.file_size }}"
+          THRESHOLD="${WF_GITHUB_EVENT_INPUTS_SPLIT_THRESHOLD_MB}"
+          FILENAME="${WF_STEPS_DOWNLOAD_OUTPUTS_DOWNLOADED_NAME}"
+          FILE_SIZE="${WF_STEPS_DOWNLOAD_OUTPUTS_FILE_SIZE}"
           LIMIT=$((THRESHOLD * 1024 * 1024))
 
           if [ -n "$FILE_SIZE" ] && [ "$FILE_SIZE" -gt "$LIMIT" ]; then
             echo "✂️ File (${FILE_SIZE} bytes) exceeds ${THRESHOLD}MB, splitting into parts..."
-            cd downloads
+            cd "$RUNNER_TEMP/meli-telegram"
             zip -s "${THRESHOLD}m" "${FILENAME}.zip" -j "$FILENAME"
             rm "$FILENAME"
             cd ..
@@ -169,79 +90,14 @@ jobs:
             echo "📦 File size within threshold, no splitting needed."
           fi
 
-      - name: 🔄 Sanitize filenames (remove non‑ASCII / special characters)
-        run: |
-          cd downloads
-          for file in *; do
-            [ -e "$file" ] || continue
-            EXT="${file##*.}"
-            if [[ "$EXT" == "$file" ]]; then
-              EXT="bin"
-            fi
-            if [[ "$file" =~ [^[:ascii:]] ]]; then
-              RANDOM_NAME=$(openssl rand -hex 8)
-              NEW_NAME="${RANDOM_NAME}.${EXT}"
-              echo "   🌐 Renaming: $file -> $NEW_NAME"
-              mv "$file" "$NEW_NAME"
-            else
-              CLEAN_NAME=$(echo "$file" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g')
-              if [ "$file" != "$CLEAN_NAME" ]; then
-                echo "   📝 Cleaning: $file -> $CLEAN_NAME"
-                mv "$file" "$CLEAN_NAME"
-              fi
-            fi
-          done
-          cd ..
-
-      - name: 📤 Upload files to GitHub (one by one)
+      - name: 📤 Commit and push files
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          if [ ! -d "downloads" ] || [ -z "$(ls -A downloads 2>/dev/null)" ]; then
-            echo "⚠️ No files to upload!"
-            exit 1
-          fi
-
-          NEW_FILES=()
-          for file in downloads/*; do
-            filename=$(basename "$file")
-            if ! git ls-files --error-unmatch "downloads/$filename" &>/dev/null; then
-              NEW_FILES+=("$filename")
-            else
-              echo "⏭️ Skipping already tracked file: $filename"
-            fi
-          done
-
-          TOTAL=${#NEW_FILES[@]}
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "✅ No new files to upload!"
-            exit 0
-          fi
-
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "📦 New files to upload: $TOTAL"
-          echo "═══════════════════════════════════════════════════════════════"
-
-          for (( i=0; i<TOTAL; i++ )); do
-            echo ""
-            echo "🚀 Uploading $((i+1)) of $TOTAL: ${NEW_FILES[$i]}"
-            git add "downloads/${NEW_FILES[$i]}"
-            git commit -m "Add ${NEW_FILES[$i]} [skip ci]"
-
-            for attempt in 1 2 3; do
-              if git push origin main 2>&1; then
-                echo "   ✅ Uploaded successfully"
-                break
-              else
-                if [ $attempt -lt 3 ]; then
-                  echo "   ⚠️ Push failed, retry $attempt/3..."
-                  git reset --soft HEAD~1
-                  sleep 5
-                else
-                  echo "   ❌ Failed to upload ${NEW_FILES[$i]}"
-                  git reset --soft HEAD~1
-                fi
-              fi
-            done
-          done
+          python3 scripts/move_outputs.py "$RUNNER_TEMP/meli-telegram" downloads
+          git add -- downloads/
+          python3 scripts/check_staged_sizes.py
+          git diff --cached --quiet || git commit -m "Download Telegram file [skip ci]"
+          bash scripts/push_current_branch.sh

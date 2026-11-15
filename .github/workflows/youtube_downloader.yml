@@ -24,7 +24,7 @@ on:
         default: '720p'
 
       max_part_mb:
-        description: 'حداکثر حجم هر قسمت (MB) - 0 = خودکار ۱۸۰۰ مگابایت'
+        description: 'حداکثر حجم هر قسمت (MiB)، ریپازیتوری: ۱ تا ۹۵؛ ریلیز: ۱ تا ۱۹۰۰'
         required: false
         type: string
         default: '90'
@@ -54,14 +54,30 @@ jobs:
 
     steps:
       - name: 📂 Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate inputs
+        env:
+          URL: ${{ inputs.video_url }}
+          SIZE: ${{ inputs.max_part_mb }}
+          METHOD: ${{ inputs.upload_method }}
+        run: |
+          MAX_SIZE=95
+          if [[ "$METHOD" == release* ]]; then MAX_SIZE=1900; fi
+          python3 scripts/validate_workflow.py --url "$URL" --size "$SIZE" --max-size "$MAX_SIZE"
 
       - name: 🔧 Install Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y zip curl python3 python3-pip
+          sudo apt-get install -y zip curl ffmpeg python3 python3-pip
           pip3 install --quiet requests
 
       - name: 🔗 Get Download Link
@@ -69,6 +85,7 @@ jobs:
         run: |
           python3 << 'EOF'
           import os, sys, time, re, requests
+          from scripts.validate_workflow import validate_url
 
           URL  = os.environ.get('INPUT_URL')
           FMT  = os.environ.get('INPUT_FORMAT')
@@ -92,7 +109,7 @@ jobs:
 
           s = requests.Session()
           s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-          s.get("https://media.ytmp3.gg/")
+          s.get("https://media.ytmp3.gg/", timeout=30)
 
           resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
           resp.raise_for_status()
@@ -100,11 +117,17 @@ jobs:
 
           status_url = data.get('statusUrl')
           title = data.get('title', 'video')
+          try:
+              validate_url(status_url)
+          except ValueError:
+              sys.exit("::error::Conversion service returned an invalid status URL")
 
           dl_url = None
-          for _ in range(150):
+          deadline = time.monotonic() + 300
+          while time.monotonic() < deadline:
               time.sleep(2)
               r = s.get(status_url, timeout=20)
+              r.raise_for_status()
               status = r.json()
               if status.get('status') == 'completed':
                   dl_url = status.get('downloadUrl')
@@ -117,7 +140,15 @@ jobs:
               print("::error::Could not get download link")
               sys.exit(1)
 
-          vid   = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL)[1]
+          match = re.search(r'(?:v=|youtu\.be/|/shorts/|/embed/)([a-zA-Z0-9_-]{11})', URL)
+          if not match:
+              sys.exit("::error::Could not determine YouTube video ID")
+          vid = match[1]
+          try:
+              validate_url(dl_url)
+          except ValueError:
+              sys.exit("::error::Conversion service returned an invalid download URL")
+          title = re.sub(r'[\r\n\x00-\x1f\x7f]+', ' ', str(title))[:200]
           clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
           clean = re.sub(r'_+', '_', clean).strip('_')[:70] or vid
           fname = f"{clean}_{vid}_{QUAL}.{FMT}"
@@ -135,22 +166,35 @@ jobs:
           INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
 
       - name: 📥 Download File
+        env:
+          INPUT_FORMAT: ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
         run: |
           DL_URL=$(head -1 .download_info)
           FILENAME=$(sed -n '2p' .download_info)
           # همه فایل‌های نهایی در release_files جمع می‌شن
           mkdir -p release_files
           echo "Downloading: $FILENAME"
-          curl -L --fail --progress-bar -o "release_files/$FILENAME" "$DL_URL"
+          curl -L --fail --progress-bar --proto '=http,https' --proto-redir '=http,https' \
+            -o "release_files/$FILENAME" -- "$DL_URL"
           if [ ! -s "release_files/$FILENAME" ]; then
             echo "::error::Downloaded file is empty!"
             exit 1
           fi
+          STREAM=a:0
+          if [ "$INPUT_FORMAT" = mp4 ]; then STREAM=v:0; fi
+          if ! ffprobe -v error -select_streams "$STREAM" -show_entries stream=codec_type \
+              -of csv=p=0 "release_files/$FILENAME" | grep -q .; then
+            echo "::error::Conversion service did not return the requested media type"
+            exit 1
+          fi
 
       - name: ✂️ Split Large File (if needed)
+        env:
+          WF_STEPS_RETRIEVE_OUTPUTS_FILENAME: ${{ steps.retrieve.outputs.filename }}
+          WF_GITHUB_EVENT_INPUTS_MAX_PART_MB: ${{ github.event.inputs.max_part_mb }}
         run: |
-          FILENAME="${{ steps.retrieve.outputs.filename }}"
-          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+          FILENAME="${WF_STEPS_RETRIEVE_OUTPUTS_FILENAME}"
+          THRESH_MB="${WF_GITHUB_EVENT_INPUTS_MAX_PART_MB}"
           if [[ "$THRESH_MB" -le 0 ]] || [[ "$THRESH_MB" -gt 1900 ]]; then
             THRESH_MB=1800
           fi
@@ -177,18 +221,22 @@ jobs:
 
       - name: 📤 Push to Repository
         if: github.event.inputs.upload_method == 'repository (push to repo)'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          WF_STEPS_RETRIEVE_OUTPUTS_FILENAME: ${{ steps.retrieve.outputs.filename }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           mkdir -p downloads
-          mv release_files/* downloads/
+          python3 scripts/move_outputs.py release_files downloads
           git add downloads/
-          git commit -m "⬇️ YouTube: ${{ steps.retrieve.outputs.filename }} [skip ci]" || echo "Nothing to commit"
-          git push
+          python3 scripts/check_staged_sizes.py
+          git diff --cached --quiet || git commit -m "⬇️ YouTube: ${WF_STEPS_RETRIEVE_OUTPUTS_FILENAME} [skip ci]"
+          bash scripts/push_current_branch.sh
 
       - name: 📤 Upload to GitHub Releases
         if: github.event.inputs.upload_method == 'release (GitHub Releases)'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-{0}', github.run_number) }}
           name: ${{ format('YouTube - {0}', steps.retrieve.outputs.filename) }}

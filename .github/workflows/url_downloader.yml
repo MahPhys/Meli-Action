@@ -45,9 +45,20 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate inputs
+        env:
+          URL: ${{ inputs.file_url }}
+          SIZE: ${{ inputs.max_part_mb }}
+          METHOD: ${{ inputs.upload_method }}
+        run: |
+          MAX_SIZE=95
+          if [[ "$METHOD" == release* ]]; then MAX_SIZE=1900; fi
+          python3 scripts/validate_workflow.py --url "$URL" --size "$SIZE" --max-size "$MAX_SIZE"
 
       - name: Install Dependencies
         run: |
@@ -57,49 +68,52 @@ jobs:
       - name: Download File
         id: download
         shell: bash
+        env:
+          WF_GITHUB_EVENT_INPUTS_FILE_URL: ${{ github.event.inputs.file_url }}
         run: |
-          mkdir -p temp_dl
+          mkdir -p temp_dl/source temp_dl/archive
 
-          FILE_URL="${{ github.event.inputs.file_url }}"
+          FILE_URL="${WF_GITHUB_EVENT_INPUTS_FILE_URL}"
 
-          FILENAME=$(basename "$FILE_URL" | cut -d'?' -f1)
-          FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
+          FILENAME=$(python3 -c 'import sys, urllib.parse; p=urllib.parse.urlsplit(sys.argv[1]).path; print(p.rsplit("/", 1)[-1])' "$FILE_URL")
+          FILENAME=$(printf '%s' "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g' | cut -c1-150)
+          [[ -n "$FILENAME" && "$FILENAME" != . && "$FILENAME" != .. ]] || FILENAME=download
 
           echo "Downloading: $FILENAME"
 
-          curl -L --fail --retry 3 \
-            -o "temp_dl/$FILENAME" \
-            "$FILE_URL"
+          curl -L --fail --retry 3 --proto '=http,https' --proto-redir '=http,https' \
+            -o "temp_dl/source/$FILENAME" \
+            -- "$FILE_URL"
 
           echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
-          echo "filepath=temp_dl/$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "filepath=temp_dl/source/$FILENAME" >> "$GITHUB_OUTPUT"
 
       - name: Create Split Archive
         id: archive
         shell: bash
+        env:
+          WF_STEPS_DOWNLOAD_OUTPUTS_FILEPATH: ${{ steps.download.outputs.filepath }}
+          WF_GITHUB_EVENT_INPUTS_ZIP_PASSWORD: ${{ github.event.inputs.zip_password }}
+          WF_GITHUB_EVENT_INPUTS_MAX_PART_MB: ${{ github.event.inputs.max_part_mb }}
         run: |
-          FILEPATH="${{ steps.download.outputs.filepath }}"
-          PASS="${{ github.event.inputs.zip_password }}"
-          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
-
-          if [[ -z "$THRESH_MB" || "$THRESH_MB" -le 0 || "$THRESH_MB" -gt 1900 ]]; then
-            THRESH_MB=1800
-          fi
+          FILEPATH="${WF_STEPS_DOWNLOAD_OUTPUTS_FILEPATH}"
+          PASS="${WF_GITHUB_EVENT_INPUTS_ZIP_PASSWORD}"
+          THRESH_MB="${WF_GITHUB_EVENT_INPUTS_MAX_PART_MB}"
 
           BASENAME=$(basename "$FILEPATH")
 
-          cd temp_dl || exit 1
+          cd temp_dl/source || exit 1
 
           ARCHIVE_BASE="${BASENAME%.*}_$(date +%Y%m%d_%H%M%S)"
 
           if [ -n "$PASS" ]; then
-            7z a -p"$PASS" -mhe=on -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
+            7z a -p"$PASS" -mhe=on -mx=3 -v${THRESH_MB}m "../archive/${ARCHIVE_BASE}.7z" -- "$BASENAME"
           else
-            7z a -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
+            7z a -mx=3 -v${THRESH_MB}m "../archive/${ARCHIVE_BASE}.7z" -- "$BASENAME"
           fi
 
-          if [ -f "${ARCHIVE_BASE}.7z.001" ] && [ ! -f "${ARCHIVE_BASE}.7z.002" ]; then
-            mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
+          if [ -f "../archive/${ARCHIVE_BASE}.7z.001" ] && [ ! -f "../archive/${ARCHIVE_BASE}.7z.002" ]; then
+            mv "../archive/${ARCHIVE_BASE}.7z.001" "../archive/${ARCHIVE_BASE}.7z"
           fi
 
           echo "archive_name=${ARCHIVE_BASE}.7z" >> "$GITHUB_OUTPUT"
@@ -115,23 +129,27 @@ jobs:
       - name: Push to Repository
         if: github.event.inputs.upload_method == 'repository'
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          WF_STEPS_DOWNLOAD_OUTPUTS_FILENAME: ${{ steps.download.outputs.filename }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           mkdir -p downloads
 
-          mv temp_dl/* downloads/ 2>/dev/null || true
+          python3 scripts/move_outputs.py temp_dl/archive downloads
 
           git add downloads/
+          python3 scripts/check_staged_sizes.py
 
-          git commit -m "Direct Download: ${{ steps.download.outputs.filename }} [skip ci]" || echo "Nothing to commit"
+          git diff --cached --quiet || git commit -m "Direct Download [skip ci]"
 
-          git push
+          bash scripts/push_current_branch.sh
 
       - name: Upload to GitHub Releases
         if: github.event.inputs.upload_method == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('direct-{0}', github.run_number) }}
           name: Direct Download Release
@@ -140,7 +158,7 @@ jobs:
 
             File: ${{ steps.download.outputs.filename }}
             Date: ${{ steps.get_date.outputs.date }}
-          files: temp_dl/*
+          files: temp_dl/archive/*
 
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
